@@ -1,0 +1,1677 @@
+using System;
+using System.Text;
+using System.IO;
+using System.Text.Json;
+using System.Linq;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
+
+namespace proposalgotgot
+{
+    enum Role
+    {
+        Owner,
+        Client
+    }
+
+    // Small console helper to centralize colored output and support cyan+bold boxed headers (uses ANSI if available)
+    static class ConsoleUtils
+    {
+        private static bool vtEnabled;
+        private static readonly Regex AnsiRegex = new Regex(@"\x1b\[[0-9;]*m", RegexOptions.Compiled);
+
+        static ConsoleUtils()
+        {
+            // try to enable ANSI (virtual terminal) on Windows so we can use bold + cyan
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                const int STD_OUTPUT_HANDLE = -11;
+                const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+
+                IntPtr handle = GetStdHandle(STD_OUTPUT_HANDLE);
+                if (handle != IntPtr.Zero)
+                {
+                    if (GetConsoleMode(handle, out uint mode))
+                    {
+                        mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                        if (SetConsoleMode(handle, mode))
+                            vtEnabled = true;
+                    }
+                }
+            }
+            else
+            {
+                // assume ANSI works on Unix-based terminals
+                vtEnabled = true;
+            }
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+        public static void Error(string message)
+        {
+            var prev = Console.ForegroundColor;
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine(message);
+            Console.ForegroundColor = prev;
+        }
+
+        public static void Success(string message)
+        {
+            var prev = Console.ForegroundColor;
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine(message);
+            Console.ForegroundColor = prev;
+        }
+
+        public static void Info(string message)
+        {
+            Console.WriteLine(message);
+        }
+
+        public static void Yellow(string message)
+        {
+            var prev = Console.ForegroundColor;
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine(message);
+            Console.ForegroundColor = prev;
+        }
+
+        // Return a colored string (ANSI) for embedding in lines when ANSI is enabled.
+        // Falls back to plain text when ANSI is not available.
+        public static string ColorText(string status)
+        {
+            if (!vtEnabled || string.IsNullOrEmpty(status))
+                return status ?? "";
+
+            string code = status switch
+            {
+                var s when string.Equals(s, "Approved", StringComparison.OrdinalIgnoreCase) => "\x1b[32m", // green
+                var s when string.Equals(s, "Declined", StringComparison.OrdinalIgnoreCase) => "\x1b[31m", // red
+                var s when string.Equals(s, "Rejected", StringComparison.OrdinalIgnoreCase) => "\x1b[31m", // red
+                var s when string.Equals(s, "Pending", StringComparison.OrdinalIgnoreCase) => "\x1b[33m", // yellow
+                _ => "\x1b[0m"
+            };
+            return $"{code}{status}\x1b[0m";
+        }
+
+        // Strip ANSI escape sequences (for accurate width measurement when ANSI is present)
+        public static string StripAnsi(string input) => string.IsNullOrEmpty(input) ? "" : AnsiRegex.Replace(input, "");
+
+        // Pad a string to target visual width while preserving ANSI codes when possible.
+        // If rightAlign is true, padding is added to the left (right-justified).
+        public static string PadAnsi(string input, int width, bool rightAlign = false)
+        {
+            input ??= "";
+            string plain = StripAnsi(input);
+            int len = plain.Length;
+            if (len == width) return input;
+            if (len < width)
+            {
+                string pad = new string(' ', width - len);
+                return rightAlign ? pad + input : input + pad;
+            }
+
+            // If longer than width, truncate the plain text (drop ANSI for truncated output).
+            return plain.Substring(0, width);
+        }
+
+        // Center text within a visual width (preserves ANSI around the content)
+        public static string CenterAnsi(string input, int width)
+        {
+            input ??= "";
+            string plain = StripAnsi(input);
+            if (plain.Length >= width) return plain.Substring(0, width);
+
+            int left = (width - plain.Length) / 2;
+            int right = width - plain.Length - left;
+            return new string(' ', left) + input + new string(' ', right);
+        }
+
+        // Header / Title: draw a boxed rectangle with cyan + bold when possible; falls back to cyan without bold.
+        public static void Title(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                Console.WriteLine();
+                return;
+            }
+
+            // normalize and remove surrounding newlines so box is neat
+            var msg = message.Trim();
+            const int padding = 2;
+            int innerWidth = msg.Length;
+            int totalInner = innerWidth + padding * 2;
+            string horizontal = new string('─', totalInner);
+            string top = $"┌{horizontal}┐";
+            string middle = $"│{new string(' ', padding)}{msg}{new string(' ', padding)}│";
+            string bottom = $"└{horizontal}┘";
+
+            if (vtEnabled)
+            {
+                // 1 = bold, 36 = cyan, 0 = reset
+                Console.WriteLine($"\x1b[1;36m{top}\n{middle}\n{bottom}\x1b[0m");
+            }
+            else
+            {
+                var prev = Console.ForegroundColor;
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine(top);
+                Console.WriteLine(middle);
+                Console.WriteLine(bottom);
+                Console.ForegroundColor = prev;
+            }
+        }
+    }
+
+    class User
+    {
+        public string Username { get; set; }
+        public string Password { get; set; }
+        public Role UserRole { get; set; }
+        public string FullName { get; set; }
+        public string HomeAddress { get; set; }
+        public string ContactNumber { get; set; }
+
+        // new registration fields
+        public int Age { get; set; }
+        public decimal MonthlyIncome { get; set; }
+        public string ValidIdType { get; set; }
+        public string ValidIdNumber { get; set; }
+
+        // single borrower id per user (assigned at registration)
+        public string BorrowerId { get; set; }
+    }
+
+    class Payment
+    {
+        public int PaymentId { get; set; }
+        public DateTime PaymentDate { get; set; }
+        public decimal AmountPaid { get; set; }
+        public string Status { get; set; } = "Completed";
+    }
+
+    class ScheduleItem
+    {
+        public int InstallmentNumber { get; set; }
+        public DateTime DueDate { get; set; }
+        public decimal PrincipalAmount { get; set; }
+        public decimal InterestAmount { get; set; }
+        public decimal TotalPayment => PrincipalAmount + InterestAmount;
+        public decimal RemainingToPay { get; set; }
+    }
+
+    class Loan
+    {
+        public string LoanId { get; set; }          // now same as BorrowerId
+        public string BorrowerId { get; set; }     // unique borrower id (e.g. 00001)
+        public string BorrowerName { get; set; }   // username
+        public decimal LoanAmount { get; set; }
+        public double InterestRate { get; set; }   // monthly percent (e.g. 10 means 10% per month)
+        public int TermMonths { get; set; }
+        public DateTime StartDate { get; set; }
+
+        // store the chosen safe monthly payment (based on DTI) so schedule uses it
+        public decimal MonthlyPayment { get; set; } = 0m;
+
+        public bool IsApproved { get; set; } = false;
+        public bool IsReviewed { get; set; } = false;
+
+        public string Status
+        {
+            get
+            {
+                if (IsApproved) return "Approved";
+                else if (!IsApproved && IsReviewed) return "Declined";
+                else return "Pending";
+            }
+        }
+
+        public List<Payment> Payments { get; set; } = new List<Payment>();
+        public List<ScheduleItem> Schedule { get; set; } = new List<ScheduleItem>();
+
+        public void GenerateSchedule()
+        {
+            if (!IsApproved) return;
+
+            Schedule.Clear();
+
+            if (TermMonths <= 0)
+            {
+                Schedule.Add(new ScheduleItem
+                {
+                    InstallmentNumber = 1,
+                    DueDate = StartDate.AddMonths(1),
+                    PrincipalAmount = LoanAmount,
+                    InterestAmount = 0,
+                    RemainingToPay = LoanAmount
+                });
+                return;
+            }
+
+            double monthlyRate = InterestRate / 100.0;
+            decimal balance = LoanAmount;
+
+            // Prefer using MonthlyPayment (safe payment based on DTI) when available
+            decimal monthlyPayment = MonthlyPayment > 0m
+                ? MonthlyPayment
+                : (decimal)((monthlyRate == 0)
+                    ? (double)LoanAmount / TermMonths
+                    : (monthlyRate * (double)LoanAmount) / (1 - Math.Pow(1 + monthlyRate, -TermMonths)));
+
+            // build schedule using monthlyPayment as the amount borrower will pay each period.
+            for (int i = 1; i <= TermMonths; i++)
+            {
+                if (balance <= 0) break;
+
+                decimal interest = Decimal.Round(balance * (decimal)monthlyRate, 2);
+                decimal principal = monthlyPayment - interest;
+
+                // if monthlyPayment is too small (principal <= 0), fallback to amortization formula to avoid infinite loop
+                if (principal <= 0)
+                {
+                    // fallback: compute amortized principal for remaining term
+                    double amortPaymentDouble;
+                    if (monthlyRate == 0) amortPaymentDouble = (double)balance / (TermMonths - i + 1);
+                    else amortPaymentDouble = (monthlyRate * (double)balance) / (1 - Math.Pow(1 + monthlyRate, -(TermMonths - i + 1)));
+                    decimal amortPayment = Decimal.Round((decimal)amortPaymentDouble, 2);
+                    interest = Decimal.Round(balance * (decimal)monthlyRate, 2);
+                    principal = amortPayment - interest;
+                    if (principal <= 0) principal = balance; // last resort
+                    monthlyPayment = amortPayment;
+                }
+
+                // last payment adjust principal to clear remaining balance
+                if (i == TermMonths || principal >= balance)
+                {
+                    principal = balance;
+                    monthlyPayment = principal + interest;
+                }
+
+                Schedule.Add(new ScheduleItem
+                {
+                    InstallmentNumber = i,
+                    DueDate = StartDate.AddMonths(i),
+                    PrincipalAmount = Decimal.Round(principal, 2),
+                    InterestAmount = Decimal.Round(interest, 2),
+                    RemainingToPay = Decimal.Round(principal + interest, 2)
+                });
+
+                balance -= principal;
+                if (balance < 0) balance = 0;
+            }
+
+            UpdateScheduleAfterPayment();
+        }
+
+        public void RecordPayment(decimal amount)
+        {
+            if (!IsApproved) return;
+
+            Payments.Add(new Payment
+            {
+                PaymentId = Payments.Count + 1,
+                PaymentDate = DateTime.Now,
+                AmountPaid = amount
+            });
+
+            UpdateScheduleAfterPayment();
+        }
+
+        public decimal CalculateRemainingBalance()
+        {
+            UpdateScheduleAfterPayment();
+            decimal totalRemaining = 0;
+            foreach (var s in Schedule) totalRemaining += s.RemainingToPay;
+            return totalRemaining;
+        }
+
+        public void UpdateScheduleAfterPayment()
+        {
+            foreach (var s in Schedule)
+                s.RemainingToPay = s.TotalPayment;
+
+            decimal totalPaid = 0;
+            foreach (var p in Payments) totalPaid += p.AmountPaid;
+
+            foreach (var s in Schedule)
+            {
+                if (totalPaid <= 0) break;
+                if (totalPaid >= s.TotalPayment)
+                {
+                    totalPaid -= s.TotalPayment;
+                    s.RemainingToPay = 0;
+                }
+                else
+                {
+                    s.RemainingToPay = s.TotalPayment - totalPaid;
+                    totalPaid = 0;
+                }
+            }
+        }
+    }
+
+    class LoanManager
+    {
+        private List<Loan> Loans = new List<Loan>();
+        private int idCounter = 0; // kept for compatibility but loan id will be BorrowerId now
+
+        public LoanManager() { }
+
+        // constructor for loading saved loans
+        public LoanManager(List<Loan> loadedLoans)
+        {
+            if (loadedLoans != null)
+                Loans = loadedLoans;
+
+            // ensure idCounter is set from existing loan IDs (not used for new loans)
+            try
+            {
+                if (Loans.Count > 0)
+                {
+                    var numericIds = Loans
+                        .Select(l => { int v; return int.TryParse(l.LoanId, out v) ? v : 0; })
+                        .ToList();
+                    idCounter = numericIds.Count > 0 ? numericIds.Max() : 0;
+                }
+            }
+            catch
+            {
+                idCounter = Loans.Count;
+            }
+        }
+
+        // AddLoan enforces single active loan per borrower and applies DTI checks.
+        // It will choose a term that keeps the borrower's monthly payment within the recommended DTI range (30%-40%).
+        // Algorithm:
+        // - Try conservative DTI (30%) first; if required term > maxTermAllowed, increase DTI stepwise up to 40%.
+        // - Choose the smallest DTI within [30%,40%] that yields requiredMonths <= maxTermAllowed.
+        // - If none found, deny application.
+        public void AddLoan(User client, decimal amount)
+        {
+            // check existing active loan: pending or approved and not fully paid
+            var hasPending = Loans.Any(l => l.BorrowerId == client.BorrowerId && !l.IsReviewed);
+            var hasUnpaidApproved = Loans.Any(l => l.BorrowerId == client.BorrowerId && l.IsApproved && l.CalculateRemainingBalance() > 0);
+
+            if (hasPending || hasUnpaidApproved)
+            {
+                ConsoleUtils.Error("You already have an active loan (pending or unpaid). Settle it before applying again.");
+                return;
+            }
+
+            // assign loan id same as borrower id
+            string loanId = client.BorrowerId;
+
+            Loan loan = new Loan
+            {
+                BorrowerId = client.BorrowerId,
+                BorrowerName = client.Username,
+                LoanAmount = amount,
+                LoanId = loanId,
+                StartDate = DateTime.Now,
+                InterestRate = 10 // 10% per month as requested
+            };
+
+            if (client.MonthlyIncome <= 0)
+            {
+                ConsoleUtils.Error("Cannot apply for loan: borrower monthly income not available.");
+                return;
+            }
+
+            const decimal minDti = 0.30M; // recommended conservative lower bound
+            const decimal maxDti = 0.40M; // maximum allowed DTI
+            const int maxTermAllowed = 36; // limit term to 36 months to reduce long-term risk
+
+            double monthlyRate = loan.InterestRate / 100.0;
+            decimal firstMonthInterest = Decimal.Round(loan.LoanAmount * (decimal)monthlyRate, 2);
+
+            decimal chosenDti = 0m;
+            int chosenMonths = 0;
+            decimal chosenSafeMonthly = 0m;
+
+            // iterate from conservative to maximum allowed DTI; choose the smallest DTI that still produces an acceptable term
+            for (decimal dti = minDti; dti <= maxDti + 0.0001m; dti += 0.01m)
+            {
+                decimal safeMonthly = Decimal.Round(client.MonthlyIncome * dti, 2);
+                decimal monthlyPrincipal = safeMonthly - firstMonthInterest;
+
+                if (monthlyPrincipal <= 0) continue; // can't cover interest with this DTI
+
+                int months = (int)Math.Ceiling((double)(loan.LoanAmount / monthlyPrincipal));
+
+                if (months <= maxTermAllowed)
+                {
+                    chosenDti = dti;
+                    chosenMonths = months <= 0 ? 1 : months;
+                    chosenSafeMonthly = safeMonthly;
+                    break;
+                }
+            }
+
+            if (chosenDti == 0m)
+            {
+                ConsoleUtils.Error($"Cannot find a repayment term within {maxTermAllowed} months while keeping payments inside recommended DTI (30%-40%). Application denied.");
+                ConsoleUtils.Info("You may try a smaller loan amount or contact the administrator to review (admin may decline or suggest alternatives).");
+                return;
+            }
+
+            loan.TermMonths = chosenMonths;
+            loan.MonthlyPayment = chosenSafeMonthly;
+
+            decimal monthlyPaymentDecimal = loan.MonthlyPayment;
+            decimal dtiResult = monthlyPaymentDecimal / client.MonthlyIncome;
+
+            ConsoleUtils.Info($"\nRequested loan amount: {loan.LoanAmount:C}");
+            ConsoleUtils.Info($"Chosen DTI: {chosenDti:P0}");
+            ConsoleUtils.Info($"Chosen term (based on DTI {chosenDti:P0}): {loan.TermMonths} months");
+            ConsoleUtils.Info($"Safe monthly payment ({chosenDti:P0} of income): {monthlyPaymentDecimal:C}");
+            ConsoleUtils.Info($"Approx first-month interest: {firstMonthInterest:C}");
+            ConsoleUtils.Info($"DTI = monthly payment / monthly income = {dtiResult:P2}");
+            ConsoleUtils.Info("Guidance: Most lenders allow 30%-40% DTI.");
+
+            if (dtiResult > maxDti)
+            {
+                ConsoleUtils.Error("DTI exceeds 40% — application denied.");
+                return;
+            }
+            else if (dtiResult > minDti)
+            {
+                ConsoleUtils.Yellow("DTI between 30%-40% — application will be submitted but flagged for careful review.");
+            }
+            else
+            {
+                ConsoleUtils.Info("DTI within conservative limits (30%).");
+            }
+
+            Loans.Add(loan);
+
+            ConsoleUtils.Success($"Loan application submitted by {client.Username} (Borrower/Loan ID: {client.BorrowerId}). Waiting for approval.\n");
+        }
+
+        public void ApproveLoan(string id, bool approve)
+        {
+            var loan = Loans.Find(l => l.LoanId == id);
+            if (loan == null) { ConsoleUtils.Error("Loan not found!"); return; }
+
+            loan.IsReviewed = true;
+            loan.IsApproved = approve;
+
+            if (approve)
+            {
+                // Merge old approved loans if exists (kept for compatibility)
+                var otherApprovedLoans = Loans.FindAll(l => l.BorrowerId == loan.BorrowerId && l.IsApproved && l != loan);
+                decimal totalAmount = loan.LoanAmount;
+                double maxInterestRate = loan.InterestRate;
+                int maxTerm = loan.TermMonths;
+
+                foreach (var l in otherApprovedLoans)
+                {
+                    totalAmount += l.LoanAmount;
+                    if (l.InterestRate > maxInterestRate) maxInterestRate = l.InterestRate;
+                    if (l.TermMonths > maxTerm) maxTerm = l.TermMonths;
+
+                    l.Schedule.Clear();
+                }
+
+                loan.LoanAmount = totalAmount;
+                loan.InterestRate = maxInterestRate;
+                loan.TermMonths = maxTerm;
+
+                // generate payment schedule now that loan is approved
+                loan.GenerateSchedule();
+            }
+            else
+            {
+                loan.Schedule.Clear();
+            }
+
+            if (approve) ConsoleUtils.Success("Loan approved!");
+            else ConsoleUtils.Error("Loan declined!");
+        }
+
+        public void ViewLoans(Role role, string username = "")
+        {
+            if (role == Role.Client)
+            {
+                var loans = GetApprovedLoansByBorrower(username);
+                if (loans.Count == 0)
+                {
+                    ConsoleUtils.Info("No loans yet.");
+                    return;
+                }
+
+                DisplayLoanDetails(loans[0]);
+            }
+            else
+            {
+                if (Loans.Count == 0)
+                {
+                    ConsoleUtils.Info("No loans yet.");
+                    return;
+                }
+
+                // show tabular view grouped by borrower (latest loan per borrower) with improved unicode box drawing
+                var grouped = Loans.GroupBy(l => l.BorrowerId)
+                                  .Select(g => g.OrderByDescending(l => l.StartDate).First())
+                                  .OrderBy(l => l.BorrowerId)
+                                  .ToList();
+
+                // column configuration (visual widths)
+                var colNames = new[] { "Borrower", "Username", "Loan ID", "Amount", "Status" };
+                var colWidths = new[] { 10, 17, 12, 15, 12 }; // visual widths for each column
+
+                // top border
+                string top = "┌" + string.Join("┬", colWidths.Select(w => new string('─', w + 2))) + "┐";
+                // header row
+                string header = "│ " + string.Join(" │ ", colNames.Select((n, i) => ConsoleUtils.CenterAnsi(n, colWidths[i]))) + " │";
+                // middle separator
+                string mid = "├" + string.Join("┼", colWidths.Select(w => new string('─', w + 2))) + "┤";
+                // bottom border
+                string bottom = "└" + string.Join("┴", colWidths.Select(w => new string('─', w + 2))) + "┘";
+
+                ConsoleUtils.Title("\n<<< All Loans (By Borrower) >>>");
+                Console.WriteLine(top);
+                Console.WriteLine(header);
+                Console.WriteLine(mid);
+
+                foreach (var latest in grouped)
+                {
+                    string borrowerCell = ConsoleUtils.PadAnsi(latest.BorrowerId ?? "", colWidths[0]);
+                    string userCell = ConsoleUtils.PadAnsi(latest.BorrowerName ?? "", colWidths[1]);
+                    string loanIdCell = ConsoleUtils.PadAnsi(latest.LoanId ?? "", colWidths[2]);
+                    string amountStr = latest.LoanAmount.ToString("C");
+                    string amountCell = ConsoleUtils.PadAnsi(amountStr, colWidths[3], rightAlign: true);
+                    string statusColored = ConsoleUtils.ColorText(latest.Status);
+                    string statusCell = ConsoleUtils.PadAnsi(statusColored, colWidths[4]);
+
+                    string row = $"│ {borrowerCell} │ {userCell} │ {loanIdCell} │ {amountCell} │ {statusCell} │";
+                    Console.WriteLine(row);
+                }
+
+                Console.WriteLine(bottom);
+            }
+        }
+
+        public List<Loan> GetApprovedLoansByBorrower(string borrowerUsername)
+        {
+            return Loans
+                .FindAll(l => l.BorrowerName == borrowerUsername && l.IsApproved)
+                .OrderByDescending(l => l.StartDate)
+                .Take(1)
+                .ToList();
+        }
+
+        public Loan GetLoanById(string id)
+        {
+            return Loans.Find(l => l.LoanId == id);
+        }
+
+        public List<Loan> GetAllLoans() => Loans;
+
+        public void ClearAllLoans()
+        {
+            Loans.Clear();
+            idCounter = 0;
+        }
+
+        public void DisplayLoanDetails(Loan loan)
+        {
+            string statusColored = ConsoleUtils.ColorText(loan.Status);
+            Console.WriteLine($"\nLoan ID: {loan.LoanId} | BorrowerID: {loan.BorrowerId} | Borrower: {loan.BorrowerName} | Amount: {loan.LoanAmount:C} | Status: {statusColored}");
+            DisplayScheduleTable(loan);
+            DisplayPaymentHistory(loan);
+            Console.WriteLine($"Total Remaining Balance: {loan.CalculateRemainingBalance():C}\n");
+        }
+
+        private void DisplayScheduleTable(Loan loan)
+        {
+            if (loan.Schedule.Count == 0)
+            {
+                Console.WriteLine("No payment schedule available.");
+                return;
+            }
+
+            // column configuration (visual widths)
+            var colNames = new[] { "No.", "Due Date", "Principal", "Interest", "Balance to Pay" };
+            var colWidths = new[] { 4, 12, 12, 12, 15 };
+
+            // box borders
+            string top = "┌" + string.Join("┬", colWidths.Select(w => new string('─', w + 2))) + "┐";
+            string header = "│ " + string.Join(" │ ", colNames.Select((n, i) => ConsoleUtils.CenterAnsi(n, colWidths[i]))) + " │";
+            string mid = "├" + string.Join("┼", colWidths.Select(w => new string('─', w + 2))) + "┤";
+            string bottom = "└" + string.Join("┴", colWidths.Select(w => new string('─', w + 2))) + "┘";
+
+            Console.WriteLine("\n──────────────────── Payment Schedule ────────────────────");
+            Console.WriteLine(top);
+            Console.WriteLine(header);
+            Console.WriteLine(mid);
+
+            decimal totalRemaining = 0m;
+            foreach (var s in loan.Schedule)
+            {
+                string noCell = ConsoleUtils.PadAnsi(s.InstallmentNumber.ToString(), colWidths[0]);
+                string dueCell = ConsoleUtils.PadAnsi(s.DueDate.ToString("MM/dd/yyyy"), colWidths[1]);
+
+                string principalStr = s.PrincipalAmount.ToString("C");
+                string principalCell = ConsoleUtils.PadAnsi(principalStr, colWidths[2], rightAlign: true);
+
+                string interestStr = s.InterestAmount.ToString("C");
+                string interestCell = ConsoleUtils.PadAnsi(interestStr, colWidths[3], rightAlign: true);
+
+                string balanceStr = s.RemainingToPay.ToString("C");
+                string balanceCell = ConsoleUtils.PadAnsi(balanceStr, colWidths[4], rightAlign: true);
+
+                string row = $"│ {noCell} │ {dueCell} │ {principalCell} │ {interestCell} │ {balanceCell} │";
+                Console.WriteLine(row);
+
+                totalRemaining += s.RemainingToPay;
+            }
+
+            Console.WriteLine(bottom);
+
+            // summary line aligned with table (approximate; kept simple)
+            // compute total table inner width to align label close to right side of table
+            int tableInnerWidth = colWidths.Sum() + (colWidths.Length - 1) * 3 + 4; // spaces for separators and paddings
+            string remainingLabel = "Remaining Balance:";
+            string remainingValue = totalRemaining.ToString("C");
+
+            // build a right-aligned summary line where value is aligned to the last column width
+            string labelPad = new string(' ', Math.Max(1, tableInnerWidth - remainingLabel.Length - remainingValue.Length));
+            Console.WriteLine($"{remainingLabel}{labelPad}{remainingValue}\n");
+        }
+
+        public void DisplayPaymentHistory(Loan loan)
+        {
+            if (loan.Payments.Count == 0)
+            {
+                Console.WriteLine("No payments made yet.");
+                return;
+            }
+
+            Console.WriteLine("\n------------- Payment History -------------");
+            Console.WriteLine("{0,-5} {1,-12} {2,12} {3,10}", "No.", "Date", "Amount", "Status");
+
+            foreach (var p in loan.Payments)
+            {
+                Console.WriteLine("{0,-5} {1,-12:MM/dd/yyyy} {2,12:C} {3,10}",
+                    p.PaymentId,
+                    p.PaymentDate,
+                    p.AmountPaid,
+                    p.Status);
+            }
+        }
+    }
+
+    // Simple report writer (unchanged, but folder path fixed to be a directory)
+    class FileHandler
+    {
+        private static string folderPath = @"Z:\L66X10W06\abaca";
+        private static string filePath = Path.Combine(folderPath, "BorrowerProfiles.txt");
+
+        // Summary report (your existing function)
+        public static void SaveAllBorrowerProfiles(List<User> users, LoanManager manager)
+        {
+            try
+            {
+                if (!Directory.Exists(folderPath))
+                    Directory.CreateDirectory(folderPath);
+
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine("<<<<<<<<<<< BORROWER PROFILES REPORT >>>>>>>>>>>\n");
+                sb.AppendLine(new string('-', 45));
+                sb.AppendLine();
+
+                foreach (var user in users)
+                {
+                    if (user.UserRole == Role.Client)
+                    {
+                        sb.AppendLine($"Username: {user.Username}");
+                        sb.AppendLine($"Borrower ID: {user.BorrowerId}");
+                        sb.AppendLine($"Full Name: {user.FullName}");
+                        sb.AppendLine($"Address: {user.HomeAddress}");
+                        sb.AppendLine($"Contact: {user.ContactNumber}");
+                        sb.AppendLine(new string('-', 40));
+
+                        var approvedLoans = manager.GetApprovedLoansByBorrower(user.Username);
+                        if (approvedLoans.Count > 0)
+                        {
+                            foreach (var loan in approvedLoans)
+                            {
+                                sb.AppendLine($"Loan ID: {loan.LoanId}");
+                                sb.AppendLine($"Amount: {loan.LoanAmount:C}");
+                                sb.AppendLine($"Interest Rate (monthly): {loan.InterestRate}%");
+                                sb.AppendLine($"Term: {loan.TermMonths} months");
+                                sb.AppendLine($"Status: {loan.Status}");
+                                sb.AppendLine($"Remaining Balance: {loan.CalculateRemainingBalance():C}");
+                                sb.AppendLine();
+
+                                sb.AppendLine("=== Payment History ===");
+                                if (loan.Payments.Count == 0)
+                                {
+                                    sb.AppendLine("No payments made yet.");
+                                }
+                                else
+                                {
+                                    foreach (var p in loan.Payments)
+                                    {
+                                        sb.AppendLine($"[{p.PaymentId}] Date: {p.PaymentDate:MM/dd/yyyy} | Amount: {p.AmountPaid:C} | Status: {p.Status}");
+                                    }
+                                }
+                                sb.AppendLine(new string('-', 40));
+                                sb.AppendLine();
+                            }
+                        }
+                        else
+                        {
+                            sb.AppendLine("No approved loans yet.");
+                            sb.AppendLine(new string('-', 40));
+                        }
+
+                        sb.AppendLine();
+                    }
+                }
+
+                sb.AppendLine("<<<<<<<<<<< END OF REPORT >>>>>>>>>>>");
+
+                File.WriteAllText(filePath, sb.ToString(), Encoding.UTF8);
+
+            }
+            catch (Exception ex)
+            {
+                ConsoleUtils.Error($" Error saving file: {ex.Message}");
+            }
+        }
+
+        // ----- New: Save separate text exports ----- (unchanged content)
+        public static void SaveSeparateFiles(List<User> users, LoanManager manager)
+        {
+            try
+            {
+                if (!Directory.Exists(folderPath))
+                    Directory.CreateDirectory(folderPath);
+
+                // Client schedules (overwrite) - include only approved loans
+                string clientScheduleFile = Path.Combine(folderPath, "client_schedule.txt");
+                using (var sw = new StreamWriter(clientScheduleFile, false, Encoding.UTF8))
+                {
+                    var allLoans = manager.GetAllLoans();
+                    foreach (var loan in allLoans.Where(l => l.IsApproved))
+                    {
+                        sw.WriteLine($"Loan ID: {loan.LoanId}");
+                        sw.WriteLine($"Borrower ID: {loan.BorrowerId}");
+                        sw.WriteLine($"Borrower: {loan.BorrowerName}");
+                        sw.WriteLine($"Amount: {loan.LoanAmount:C}");
+                        sw.WriteLine($"Interest Rate (monthly): {loan.InterestRate}%");
+                        sw.WriteLine($"Term (months): {loan.TermMonths}");
+                        sw.WriteLine($"Start Date: {loan.StartDate:MM/dd/yyyy}");
+                        sw.WriteLine("Schedule:");
+                        if (loan.Schedule.Count == 0)
+                        {
+                            sw.WriteLine("  (No schedule generated)");
+                        }
+                        else
+                        {
+                            foreach (var s in loan.Schedule)
+                            {
+                                sw.WriteLine($"  {s.InstallmentNumber}. Due: {s.DueDate:MM/dd/yyyy} | Principal: {s.PrincipalAmount:C} | Interest: {s.InterestAmount:C} | Balance to Pay: {s.RemainingToPay:C}");
+                            }
+                        }
+
+                        sw.WriteLine("Payments:");
+                        if (loan.Payments.Count == 0)
+                        {
+                            sw.WriteLine("  (No payments)");
+                        }
+                        else
+                        {
+                            foreach (var p in loan.Payments)
+                                sw.WriteLine($"  [{p.PaymentId}] {p.PaymentDate:MM/dd/yyyy} - {p.AmountPaid:C} - {p.Status}");
+                        }
+
+                        sw.WriteLine(new string('-', 60));
+                    }
+                }
+
+                // Approved clients (overwrite)
+                string approvedClientsFile = Path.Combine(folderPath, "approved_clients.txt");
+                using (var sw = new StreamWriter(approvedClientsFile, false, Encoding.UTF8))
+                {
+                    var approved = manager.GetAllLoans().Where(l => l.IsApproved).ToList();
+                    if (approved.Count == 0) sw.WriteLine("(none)");
+                    foreach (var loan in approved)
+                    {
+                        sw.WriteLine($"{loan.LoanId} | {loan.BorrowerId} | {loan.BorrowerName} | {loan.LoanAmount:C} | Status: {loan.Status}");
+                    }
+                }
+
+                // Pending clients (overwrite)
+                string pendingClientsFile = Path.Combine(folderPath, "pending_clients.txt");
+                using (var sw = new StreamWriter(pendingClientsFile, false, Encoding.UTF8))
+                {
+                    var pending = manager.GetAllLoans().Where(l => !l.IsReviewed && !l.IsApproved).ToList();
+                    if (pending.Count == 0) sw.WriteLine("(none)");
+                    foreach (var loan in pending)
+                    {
+                        sw.WriteLine($"{loan.LoanId} | {loan.BorrowerId} | {loan.BorrowerName} | {loan.LoanAmount:C} | Status: Pending");
+                    }
+                }
+
+                // Rejected clients (overwrite)
+                string rejectedClientsFile = Path.Combine(folderPath, "rejected_clients.txt");
+                using (var sw = new StreamWriter(rejectedClientsFile, false, Encoding.UTF8))
+                {
+                    var rejected = manager.GetAllLoans().Where(l => l.IsReviewed && !l.IsApproved).ToList();
+                    if (rejected.Count == 0) sw.WriteLine("(none)");
+                    foreach (var loan in rejected)
+                    {
+                        sw.WriteLine($"{loan.LoanId} | {loan.BorrowerId} | {loan.BorrowerName} | {loan.LoanAmount:C} | Status: Rejected");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ConsoleUtils.Error($"Error saving separate files: {ex.Message}");
+            }
+        }
+    }
+
+    // New persistence class to save/load users & loans
+    class DataStorage
+    {
+        public static string dataFolder = @"Z:\L66X10W06\abaca";
+        private static string usersFile = Path.Combine(dataFolder, "Users.json");
+        private static string loansFile = Path.Combine(dataFolder, "Loans.json");
+
+        public static void SaveData(List<User> users, LoanManager manager)
+        {
+            try
+            {
+                if (!Directory.Exists(dataFolder))
+                    Directory.CreateDirectory(dataFolder);
+
+                var usersJson = JsonSerializer.Serialize(users, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(usersFile, usersJson);
+
+                var loansJson = JsonSerializer.Serialize(manager.GetAllLoans(), new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(loansFile, loansJson);
+
+                // also update the human-readable separate files
+                FileHandler.SaveAllBorrowerProfiles(users, manager);
+                FileHandler.SaveSeparateFiles(users, manager);
+            }
+            catch (Exception ex)
+            {
+                ConsoleUtils.Error($"Error saving data: {ex.Message}");
+            }
+        }
+
+        public static List<User> LoadUsers()
+        {
+            try
+            {
+                if (!File.Exists(usersFile)) return new List<User>();
+                string json = File.ReadAllText(usersFile);
+                return JsonSerializer.Deserialize<List<User>>(json) ?? new List<User>();
+            }
+            catch
+            {
+                return new List<User>();
+            }
+        }
+
+        public static List<Loan> LoadLoans()
+        {
+            try
+            {
+                if (!File.Exists(loansFile)) return new List<Loan>();
+                string json = File.ReadAllText(loansFile);
+                return JsonSerializer.Deserialize<List<Loan>>(json) ?? new List<Loan>();
+            }
+            catch
+            {
+                return new List<Loan>();
+            }
+        }
+
+        public static void DeleteAllSavedData()
+        {
+            try
+            {
+                if (Directory.Exists(dataFolder))
+                    Directory.Delete(dataFolder, true); // deletes files inside
+
+                var reportFolder = Path.Combine(@"D:\coding csharp\finalprog");
+                if (Directory.Exists(reportFolder))
+                    Directory.Delete(reportFolder, true);
+
+                var reportPath = Path.Combine(@"D:\coding csharp", "BorrowerProfiles.txt");
+                if (File.Exists(reportPath))
+                    File.Delete(reportPath);
+
+                ConsoleUtils.Success(" All saved data deleted.");
+            }
+            catch (Exception ex)
+            {
+                ConsoleUtils.Error($"Error deleting saved data: {ex.Message}");
+            }
+        }
+    }
+
+    class Program
+    {
+        static List<User> Users = new List<User>();
+        static LoanManager manager;
+        static User currentUser = null;
+
+        // single counter for borrower ids
+        static int userIdCounter = 0;
+
+        static void Main(string[] args)
+        {
+            // register handlers so we always attempt to save on exit (normal exit, Ctrl+C, etc.)
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => OnProcessExit();
+            Console.CancelKeyPress += (s, e) =>
+            {
+                // save when Ctrl+C is pressed
+                OnProcessExit();
+                // allow the process to terminate
+                e.Cancel = false;
+            };
+
+            // Load saved data
+            Users = DataStorage.LoadUsers();
+            var loadedLoans = DataStorage.LoadLoans();
+            manager = new LoanManager(loadedLoans);
+
+            // compute next user id from existing users (if any)
+            try
+            {
+                if (Users.Count > 0)
+                {
+                    userIdCounter = Users
+                        .Select(u => { int v; return int.TryParse(u.BorrowerId, out v) ? v : 0; })
+                        .DefaultIfEmpty(0)
+                        .Max();
+                }
+            }
+            catch
+            {
+                userIdCounter = Users.Count;
+            }
+
+            // Ensure admin exists (pre-created account)
+            if (!Users.Any(u => string.Equals(u.Username, "adminloan", StringComparison.OrdinalIgnoreCase)))
+            {
+                Users.Add(new User
+                {
+                    Username = "adminloan",
+                    Password = "12345",
+                    FullName = "System Administrator",
+                    HomeAddress = "",
+                    ContactNumber = "",
+                    UserRole = Role.Owner,
+                    Age = 0,
+                    MonthlyIncome = 0,
+                    ValidIdType = "",
+                    ValidIdNumber = "",
+                    BorrowerId = "00000"
+                });
+
+                // save the admin to storage
+                DataStorage.SaveData(Users, manager);
+            }
+
+            while (true)
+            {
+                if (currentUser == null)
+                {
+                    ConsoleUtils.Title("\n<<< Loan System >>>");
+                    ConsoleUtils.Yellow("1. Register");
+                    ConsoleUtils.Yellow("2. Login");
+                    ConsoleUtils.Yellow("0. Exit");
+                    Console.Write("Select: ");
+                    string opt = Console.ReadLine();
+
+                    if (opt == "1")
+                    {
+                        Register();
+                        DataStorage.SaveData(Users, manager);
+                    }
+                    else if (opt == "2") Login();
+                    else if (opt == "0")
+                    {
+                        DataStorage.SaveData(Users, manager);
+                        break;
+                    }
+                    else ConsoleUtils.Error("Invalid!");
+                }
+                else
+                {
+                    if (currentUser.UserRole == Role.Owner)
+                        OwnerMenu();
+                    else
+                        ClientMenu();
+                }
+            }
+        }
+
+        static void OnProcessExit()
+        {
+            try
+            {
+                // make sure current state saved
+                if (Users != null && manager != null)
+                    DataStorage.SaveData(Users, manager);
+            }
+            catch
+            {
+                // ignore exceptions during exit
+            }
+        }
+
+        // Read password from console and show '*' characters
+        static string ReadPasswordMasked()
+        {
+            var sb = new StringBuilder();
+            while (true)
+            {
+                var key = Console.ReadKey(true);
+                if (key.Key == ConsoleKey.Enter)
+                {
+                    Console.WriteLine();
+                    break;
+                }
+                else if (key.Key == ConsoleKey.Backspace)
+                {
+                    if (sb.Length > 0)
+                    {
+                        sb.Length--;
+                        Console.Write("\b \b");
+                    }
+                }
+                else if (!char.IsControl(key.KeyChar))
+                {
+                    sb.Append(key.KeyChar);
+                    Console.Write('*');
+                }
+            }
+            return sb.ToString();
+        }
+
+        static void Register()
+        {
+            ConsoleUtils.Title("\n<<< Registration >>>");
+
+            Console.Write("Username: ");
+            string user = Console.ReadLine()?.Trim();
+
+            Console.Write("Password: ");
+            string pass = ReadPasswordMasked();
+
+            Console.Write("Full Name: ");
+            string name = Console.ReadLine()?.Trim();
+
+            Console.Write("Home Address: ");
+            string address = Console.ReadLine()?.Trim();
+
+            Console.Write("Contact Number: ");
+            string number = Console.ReadLine()?.Trim();
+
+            // new required fields
+            Console.Write("Age (must be 21+): ");
+            string ageInput = Console.ReadLine()?.Trim();
+
+            Console.Write("Monthly Income: ");
+            string incomeInput = Console.ReadLine()?.Trim();
+
+            Console.Write("Valid ID Type (e.g. Driver's License, Passport, NationalID): ");
+            string idType = Console.ReadLine()?.Trim();
+
+            Console.Write("Valid ID Number: ");
+            string idNumber = Console.ReadLine()?.Trim();
+
+            // Validate: no blanks allowed for required fields
+            bool anyBlank = string.IsNullOrWhiteSpace(user)
+                            || string.IsNullOrWhiteSpace(pass)
+                            || string.IsNullOrWhiteSpace(name)
+                            || string.IsNullOrWhiteSpace(address)
+                            || string.IsNullOrWhiteSpace(number)
+                            || string.IsNullOrWhiteSpace(ageInput)
+                            || string.IsNullOrWhiteSpace(incomeInput)
+                            || string.IsNullOrWhiteSpace(idType)
+                            || string.IsNullOrWhiteSpace(idNumber);
+
+            if (anyBlank)
+            {
+                ConsoleUtils.Error("Registration declined: all fields are required.");
+                return;
+            }
+
+            if (!int.TryParse(ageInput, out int age) || age < 21)
+            {
+                ConsoleUtils.Error("Registration declined: age must be a number and at least 21.");
+                return;
+            }
+
+            if (!Decimal.TryParse(incomeInput, out decimal monthlyIncome) || monthlyIncome <= 0)
+            {
+                ConsoleUtils.Error("Registration declined: monthly income must be a positive number.");
+                return;
+            }
+
+            // generate unique borrower id for this user
+            userIdCounter++;
+            string borrowerId = userIdCounter.ToString("D5");
+
+            // If passed validation, create the user (admin already pre-created)
+            Role role = Role.Client;
+
+            User newUser = new User
+            {
+                Username = user,
+                Password = pass,
+                FullName = name,
+                HomeAddress = address,
+                ContactNumber = number,
+                UserRole = role,
+                Age = age,
+                MonthlyIncome = monthlyIncome,
+                ValidIdType = idType,
+                ValidIdNumber = idNumber,
+                BorrowerId = borrowerId
+            };
+
+            Users.Add(newUser);
+
+            ConsoleUtils.Success($"Client registered successfully! Borrower ID: {borrowerId}");
+
+            // Save separate borrower profile immediately
+            FileHandler.SaveSeparateFiles(Users, manager);
+            FileHandler.SaveAllBorrowerProfiles(Users, manager);
+        }
+
+        static void Login()
+        {
+            Console.Write("Username: ");
+            string user = Console.ReadLine();
+            Console.Write("Password: ");
+            string pass = ReadPasswordMasked();
+
+            currentUser = Users.Find(u => u.Username == user && u.Password == pass);
+            if (currentUser == null)
+                ConsoleUtils.Error("Login failed!");
+            else
+                ConsoleUtils.Success($"Welcome {currentUser.FullName} ({currentUser.UserRole})!");
+        }
+
+        static void OwnerMenu()
+        {
+            while (true)
+            {
+                ConsoleUtils.Title("\n<<< Owner Menu >>>");
+                ConsoleUtils.Yellow("1. View All Loans");
+                ConsoleUtils.Yellow("2. Approve/Disapprove Loan");
+                ConsoleUtils.Yellow("3. View Borrower Profiles");
+                ConsoleUtils.Yellow("4. Update/Add Payment (pay for client / increase balance)");
+                ConsoleUtils.Yellow("5. Borrower Search");
+                ConsoleUtils.Yellow("6. View Borrower Schedule");
+                ConsoleUtils.Yellow("7. Logout");
+                Console.Write("Select: ");
+                string ch = Console.ReadLine();
+
+                switch (ch)
+                {
+                    case "1":
+                        manager.ViewLoans(Role.Owner);
+                        break;
+                    case "2":
+                        HandleApproveDisapprove();
+                        break;
+                    case "3":
+                        ViewBorrowerProfiles();
+                        break;
+                    case "4":
+                        OwnerUpdateOrAddPayment();
+                        break;
+                    case "5":
+                        BorrowerSearchById();
+                        break;
+                    case "6":
+                        ViewBorrowerScheduleById();
+                        break;
+                    case "7":
+                        // clear the console so when we return to main menu it's clean
+                        Console.Clear();
+                        currentUser = null;
+                        return;
+                    default:
+                        ConsoleUtils.Error("Invalid!");
+                        break;
+                }
+            }
+        }
+
+        // borrower search by id -> shows profile and loan (same as before)
+        static void BorrowerSearchById()
+        {
+            Console.Write("Enter Borrower ID to search: ");
+            string id = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(id))
+            {
+                ConsoleUtils.Error("Invalid ID.");
+                return;
+            }
+
+            var user = Users.Find(u => u.BorrowerId == id);
+            if (user == null)
+            {
+                ConsoleUtils.Error("Borrower not found.");
+                return;
+            }
+
+            ConsoleUtils.Title($"\n<<< Borrower Profile: {id} >>>");
+            Console.WriteLine($"Username: {user.Username}");
+            Console.WriteLine($"Borrower ID: {user.BorrowerId}");
+            Console.WriteLine($"Full Name: {user.FullName}");
+            Console.WriteLine($"Address: {user.HomeAddress}");
+            Console.WriteLine($"Contact: {user.ContactNumber}");
+            Console.WriteLine($"Age: {user.Age}");
+            Console.WriteLine($"Monthly Income: {user.MonthlyIncome:C}");
+            Console.WriteLine($"Valid ID: {user.ValidIdType} - {user.ValidIdNumber}");
+
+            var loan = manager.GetLoanById(id) ?? manager.GetAllLoans().Where(l => l.BorrowerId == id).OrderByDescending(l => l.StartDate).FirstOrDefault();
+            if (loan == null)
+            {
+                ConsoleUtils.Info("\nNo loan record found for this borrower.");
+            }
+            else
+            {
+                ConsoleUtils.Title("\n<<< Loan Summary >>>");
+                Console.WriteLine($"Loan ID: {loan.LoanId}");
+                Console.WriteLine($"Requested Loan Amount: {loan.LoanAmount:C}");
+                Console.WriteLine($"Interest Rate (monthly): {loan.InterestRate}%");
+                Console.WriteLine($"Term: {loan.TermMonths} months");
+                Console.WriteLine($"Status: {ConsoleUtils.ColorText(loan.Status)}");
+                Console.WriteLine($"Remaining Balance: {loan.CalculateRemainingBalance():C}");
+            }
+        }
+
+        // new admin function: show schedule for borrower by id (latest loan)
+        static void ViewBorrowerScheduleById()
+        {
+            Console.Write("Enter Borrower ID to view schedule: ");
+            string id = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(id))
+            {
+                ConsoleUtils.Error("Invalid ID.");
+                return;
+            }
+
+            var loan = manager.GetLoanById(id) ?? manager.GetAllLoans().Where(l => l.BorrowerId == id).OrderByDescending(l => l.StartDate).FirstOrDefault();
+            if (loan == null)
+            {
+                ConsoleUtils.Info("No loan found for that Borrower ID.");
+                return;
+            }
+
+            ConsoleUtils.Title($"\n<<< Payment Schedule for {id} >>>");
+            manager.DisplayLoanDetails(loan);
+        }
+
+        static void HandleApproveDisapprove()
+        {
+            var pending = manager.GetAllLoans().FindAll(l => !l.IsReviewed);
+            if (pending.Count == 0)
+            {
+                ConsoleUtils.Info("No pending loans.");
+                return;
+            }
+
+            ConsoleUtils.Title("\n<<< Pending Loans >>>");
+            Console.WriteLine("{0,-4} {1,-8} {2,-15} {3,12} {4,-10} {5,-9}", "No", "Borrower", "Username", "Amount", "LoanID", "Status");
+            int idx = 1;
+            foreach (var l in pending)
+            {
+                string status = ConsoleUtils.ColorText(l.Status);
+                Console.WriteLine("{0,-4} {1,-8} {2,-15} {3,12:C} {4,-10} {5,-9}", idx++, l.BorrowerId, l.BorrowerName, l.LoanAmount, l.LoanId, status);
+            }
+
+            Console.Write("Enter Loan ID to review: ");
+            string loanId = Console.ReadLine();
+
+            var loan = manager.GetLoanById(loanId);
+            if (loan == null)
+            {
+                ConsoleUtils.Error("Loan not found!");
+                return;
+            }
+
+            // Show loan application details
+            decimal currentBalance = 0;
+            var approvedLoans = manager.GetApprovedLoansByBorrower(loan.BorrowerName);
+            foreach (var l in approvedLoans) currentBalance += l.CalculateRemainingBalance();
+
+            ConsoleUtils.Title("\n<<<< Loan Application Details >>>>");
+            Console.WriteLine($"Borrower Username: {loan.BorrowerName}");
+            var user = Users.Find(u => u.BorrowerId == loan.BorrowerId || u.Username == loan.BorrowerName);
+            if (user != null)
+            {
+                Console.WriteLine($"Borrower ID: {user.BorrowerId}");
+                Console.WriteLine($"Full Name: {user.FullName}");
+                Console.WriteLine($"Address: {user.HomeAddress}");
+                Console.WriteLine($"Contact: {user.ContactNumber}");
+                Console.WriteLine($"Age: {user.Age}");
+                Console.WriteLine($"Monthly Income: {user.MonthlyIncome:C}");
+                Console.WriteLine($"Valid ID: {user.ValidIdType} - {user.ValidIdNumber}");
+            }
+            // show requested amount explicitly
+            Console.WriteLine($"Requested Loan Amount: {loan.LoanAmount:C}");
+            Console.WriteLine($"Interest Rate (monthly): {loan.InterestRate}%");
+            Console.WriteLine($"Proposed Term: {loan.TermMonths} months");
+            Console.WriteLine($"Date Applied: {loan.StartDate.ToShortDateString()}");
+            Console.WriteLine($"Current Status: {ConsoleUtils.ColorText(loan.Status)}");
+            Console.WriteLine($"Current Balance: {currentBalance:C}");
+
+            // --- Debt-to-Income (DTI) guidance ---
+            if (user != null && user.MonthlyIncome > 0 && loan.TermMonths > 0)
+            {
+                double monthlyRate = loan.InterestRate / 100.0;
+                double monthlyPaymentDouble;
+                if (monthlyRate == 0)
+                    monthlyPaymentDouble = (double)loan.LoanAmount / loan.TermMonths;
+                else
+                    // if MonthlyPayment stored (safe monthly), use that; else compute amortized
+                    monthlyPaymentDouble = loan.MonthlyPayment > 0
+                        ? (double)loan.MonthlyPayment
+                        : (monthlyRate * (double)loan.LoanAmount) / (1 - Math.Pow(1 + monthlyRate, -loan.TermMonths));
+
+                decimal monthlyPayment = Decimal.Round((decimal)monthlyPaymentDouble, 2);
+                decimal dti = monthlyPayment / user.MonthlyIncome;
+
+                ConsoleUtils.Info($"\nEstimated monthly payment: {monthlyPayment:C}");
+                ConsoleUtils.Info($"DTI = monthly payment / monthly income = {dti:P2}");
+                ConsoleUtils.Info("Guidance: Most lenders allow 30%-40% DTI.");
+                if (dti > 0.40M)
+                {
+                    ConsoleUtils.Error("DTI exceeds 40% — loan will be declined automatically.");
+                    manager.ApproveLoan(loanId, false);
+                    DataStorage.SaveData(Users, manager);
+                    FileHandler.SaveSeparateFiles(Users, manager);
+                    return;
+                }
+                else if (dti > 0.30M)
+                {
+                    ConsoleUtils.Yellow("DTI is between 30% and 40% — proceed with caution and consider declining.");
+                }
+                else
+                {
+                    ConsoleUtils.Info("DTI is within conservative limits (<30%).");
+                }
+            }
+
+            Console.Write("\nApprove this loan? (y/n): ");
+            string approveChoice = Console.ReadLine().ToLower();
+            manager.ApproveLoan(loanId, approveChoice == "y");
+
+            // Save after approval decision
+            DataStorage.SaveData(Users, manager);
+
+            // Save separate files (schedules, lists)
+            FileHandler.SaveSeparateFiles(Users, manager);
+
+            // Display updated loan details
+            approvedLoans = manager.GetApprovedLoansByBorrower(loan.BorrowerName);
+            foreach (var l in approvedLoans)
+            {
+                manager.DisplayLoanDetails(l);
+            }
+
+            FileHandler.SaveAllBorrowerProfiles(Users, manager);
+        }
+
+        static void ViewBorrowerProfiles()
+        {
+            ConsoleUtils.Title("\n<<< Borrower Profiles >>>");
+            foreach (var user in Users)
+            {
+                if (user.UserRole == Role.Client)
+                {
+                    Console.WriteLine($"\nUsername: {user.Username}");
+                    Console.WriteLine($"Borrower ID: {user.BorrowerId}");
+                    Console.WriteLine($"Full Name: {user.FullName}");
+                    Console.WriteLine($"Address: {user.HomeAddress}");
+                    Console.WriteLine($"Contact: {user.ContactNumber}");
+                    Console.WriteLine($"Age: {user.Age}");
+                    Console.WriteLine($"Monthly Income: {user.MonthlyIncome:C}");
+                    Console.WriteLine($"Valid ID: {user.ValidIdType} - {user.ValidIdNumber}");
+
+                    var approvedLoans = manager.GetApprovedLoansByBorrower(user.Username);
+                    if (approvedLoans.Count > 0)
+                    {
+                        foreach (var loan in approvedLoans)
+                        {
+                            manager.DisplayLoanDetails(loan);
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("No approved loans yet.");
+                    }
+                }
+            }
+
+            // After showing all borrowers, save everything to file
+            FileHandler.SaveSeparateFiles(Users, manager);
+            FileHandler.SaveAllBorrowerProfiles(Users, manager);
+        }
+
+        static void OwnerUpdateOrAddPayment()
+        {
+            Console.Write("Enter Loan ID: ");
+            string loanId = Console.ReadLine();
+            var loan = manager.GetLoanById(loanId);
+            if (loan == null)
+            {
+                ConsoleUtils.Error("Loan not found!");
+                return;
+            }
+
+            Console.WriteLine($"\nSelected Loan [{loan.LoanId}] Borrower: {loan.BorrowerName} - Balance remaining: {loan.CalculateRemainingBalance():C}");
+            ConsoleUtils.Yellow("Options:");
+            ConsoleUtils.Yellow("1. Record a payment on behalf of client (owner pays)");
+            ConsoleUtils.Yellow("2. Increase client's loan balance (add more debt)");
+            Console.Write("Select: ");
+            string opt = Console.ReadLine();
+
+            if (opt == "1")
+            {
+                Console.Write("Enter payment amount: ");
+                if (!Decimal.TryParse(Console.ReadLine(), out decimal payAmt) || payAmt <= 0)
+                {
+                    ConsoleUtils.Error("Invalid amount.");
+                    return;
+                }
+                loan.RecordPayment(payAmt);
+            }
+            else if (opt == "2")
+            {
+                Console.Write("Enter amount to add to loan (increase balance): ");
+                if (!Decimal.TryParse(Console.ReadLine(), out decimal addAmt) || addAmt <= 0)
+                {
+                    ConsoleUtils.Error("Invalid amount.");
+                    return;
+                }
+                loan.LoanAmount += addAmt;
+                // regenerate schedule only if approved
+                if (loan.IsApproved) loan.GenerateSchedule();
+            }
+            else
+            {
+                ConsoleUtils.Error("Invalid option.");
+                return;
+            }
+
+            // Save changes
+            DataStorage.SaveData(Users, manager);
+            FileHandler.SaveSeparateFiles(Users, manager);
+
+            ConsoleUtils.Info($"New remaining balance: {loan.CalculateRemainingBalance():C}");
+            manager.DisplayLoanDetails(loan);
+            FileHandler.SaveAllBorrowerProfiles(Users, manager);
+        }
+
+        static void ClientMenu()
+        {
+            while (true)
+            {
+                ConsoleUtils.Title("\n<<< Client Menu >>>");
+                ConsoleUtils.Yellow("1. Apply for Loan");
+                ConsoleUtils.Yellow("2. View My Loan + Schedule");
+                ConsoleUtils.Yellow("3. Make Payment");
+                ConsoleUtils.Yellow("4. View Payment History");
+                ConsoleUtils.Yellow("5. Logout");
+                Console.Write("Select: ");
+                string ch = Console.ReadLine();
+
+                switch (ch)
+                {
+                    case "1":
+                        Console.Write("Enter Loan Amount: ");
+                        if (!Decimal.TryParse(Console.ReadLine(), out decimal amt) || amt <= 0)
+                        {
+                            ConsoleUtils.Error("Invalid amount");
+                            break;
+                        }
+                        manager.AddLoan(currentUser, amt);
+                        DataStorage.SaveData(Users, manager);
+                        FileHandler.SaveSeparateFiles(Users, manager);
+                        break;
+
+                    case "2":
+                        var loansToView = manager.GetApprovedLoansByBorrower(currentUser.Username);
+                        if (loansToView.Count == 0)
+                        {
+                            ConsoleUtils.Info("No approved loans yet.");
+                        }
+                        else
+                        {
+                            // Display only the latest approved loan
+                            manager.DisplayLoanDetails(loansToView[0]);
+                        }
+                        break;
+
+                    case "3":
+                        var loansToPay = manager.GetApprovedLoansByBorrower(currentUser.Username);
+                        if (loansToPay.Count == 0)
+                        {
+                            ConsoleUtils.Info("No approved loans!");
+                            break;
+                        }
+
+                        var latestLoanToPay = loansToPay[0];
+                        Console.WriteLine($"Loan ID: {latestLoanToPay.LoanId} - Remaining Balance: {latestLoanToPay.CalculateRemainingBalance():C}");
+
+                        Console.Write("Enter payment amount: ");
+                        if (!Decimal.TryParse(Console.ReadLine(), out decimal payAmt) || payAmt <= 0)
+                        {
+                            ConsoleUtils.Error("Invalid amount!");
+                            break;
+                        }
+
+                        latestLoanToPay.RecordPayment(payAmt);
+                        DataStorage.SaveData(Users, manager);
+                        FileHandler.SaveSeparateFiles(Users, manager);
+
+                        ConsoleUtils.Success($"Payment successful! Remaining Balance: {latestLoanToPay.CalculateRemainingBalance():C}");
+                        FileHandler.SaveAllBorrowerProfiles(Users, manager);
+                        break;
+
+                    case "4":
+                        var loansForHistory = manager.GetApprovedLoansByBorrower(currentUser.Username);
+                        if (loansForHistory.Count == 0)
+                        {
+                            ConsoleUtils.Info("No approved loan record found!");
+                        }
+                        else
+                        {
+                            var latestLoanForHistory = loansForHistory[0];
+                            if (latestLoanForHistory.Payments.Count == 0)
+                            {
+                                ConsoleUtils.Info("No payments made yet.");
+                            }
+                            else
+                            {
+                                manager.DisplayPaymentHistory(latestLoanForHistory);
+                            }
+                        }
+                        break;
+
+                    case "5":
+                        // clear the console so when we return to main menu it's clean
+                        Console.Clear();
+                        currentUser = null;
+                        return;
+
+                    default:
+                        ConsoleUtils.Error("Invalid!");
+                        break;
+                }
+            }
+        }
+
+        // kept for compatibility; not used directly in menus currently
+        static void ViewClientLoan()
+        {
+            var loans = manager.GetApprovedLoansByBorrower(currentUser.Username);
+            if (loans.Count == 0)
+            {
+                ConsoleUtils.Info("No approved loans yet.");
+                return;
+            }
+
+            foreach (var loan in loans)
+            {
+                manager.DisplayLoanDetails(loan);
+            }
+        }
+
+        // kept for compatibility
+        static void MakePayment()
+        {
+            var loans = manager.GetApprovedLoansByBorrower(currentUser.Username);
+            if (loans.Count == 0) { ConsoleUtils.Info("No approved loans!"); return; }
+
+            foreach (var loan in loans)
+                Console.WriteLine($"{loan.LoanId} - Remaining Balance: {loan.CalculateRemainingBalance():C}");
+
+            Console.Write("Enter Loan ID to pay: ");
+            string loanId = Console.ReadLine();
+            var selectedLoan = manager.GetLoanById(loanId);
+            if (selectedLoan == null || !selectedLoan.IsApproved)
+            {
+                ConsoleUtils.Error("Loan not found or not approved!");
+                return;
+            }
+
+            Console.Write("Enter payment amount: ");
+            if (!Decimal.TryParse(Console.ReadLine(), out decimal amt) || amt <= 0)
+            {
+                ConsoleUtils.Error("Invalid amount!");
+                return;
+            }
+
+            selectedLoan.RecordPayment(amt);
+            DataStorage.SaveData(Users, manager);
+            FileHandler.SaveSeparateFiles(Users, manager);
+            ConsoleUtils.Success($"Payment successful! Remaining Balance: {selectedLoan.CalculateRemainingBalance():C}");
+        }
+    }
+}
